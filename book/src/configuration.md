@@ -40,14 +40,16 @@ teamtype share \
 - **`--allowed-users`**: Comma-separated list of permitted values for the username claim. Which claim is read from the token is controlled by `--username-claim` (default: `sub`). Joining peers whose token's claim value is not in this list are rejected.
 - **`--jwks-url`**: URL of the JWKS endpoint used to verify JWT signatures. Keycloak exposes this at `<realm-url>/protocol/openid-connect/certs`. Both flags must be set together.
 - **`--username-claim`**: Name of the JWT claim to match against `--allowed-users`. Defaults to `sub`. Set to `preferred_username` (or `email`, `azp`, etc.) if your identity provider uses a different claim.
+- **`--audience`**: Expected audience value. When set, the token's `aud` claim must contain this string, otherwise the connection is rejected. The `aud` claim may be a single string or a list of strings (RFC 7519). Omit this flag to skip audience validation.
 
-Example using Keycloak's `preferred_username`:
+Example using Keycloak's `preferred_username` and enforcing an audience:
 
 ```bash
 teamtype share \
   --allowed-users alice,bob \
   --jwks-url https://keycloak.example.com/realms/myrealm/protocol/openid-connect/certs \
-  --username-claim preferred_username
+  --username-claim preferred_username \
+  --audience my-teamtype-client
 ```
 
 The host fetches the JWKS keys on startup and uses them to verify every incoming connection. RS256 tokens are supported.

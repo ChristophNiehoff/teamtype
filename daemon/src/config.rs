@@ -59,6 +59,9 @@ pub struct AppConfig {
     /// Name of the JWT claim to match against `allowed_users` (host side only).
     /// Defaults to `"sub"` when not set.
     pub username_claim: Option<String>,
+    /// Expected JWT audience value (host side only).
+    /// When set, the token's `aud` claim must contain this string.
+    pub audience: Option<String>,
 }
 
 impl AppConfig {
@@ -127,6 +130,7 @@ impl AppConfig {
             allowed_users: app_config_cli.allowed_users,
             jwks_url: app_config_cli.jwks_url,
             username_claim: app_config_cli.username_claim,
+            audience: app_config_cli.audience,
             // auth_token can optionally be stored in the config file for convenience.
             auth_token: app_config_cli.auth_token.or_else(|| {
                 general_section

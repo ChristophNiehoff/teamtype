@@ -79,6 +79,7 @@ enum PeerAuth {
         jwks: Option<Arc<JwksCache>>,
         allowed_users: Option<Arc<Vec<String>>>,
         username_claim: String,
+        audience: Option<String>,
     },
     /// Connecting side: send the passphrase and, when an auth token is present,
     /// also send the JWT and wait for the host's accept/reject response.
@@ -102,6 +103,7 @@ impl ConnectionManager {
         allowed_users: Option<Vec<String>>,
         jwks_url: Option<String>,
         username_claim: Option<String>,
+        audience: Option<String>,
     ) -> Result<Self> {
         let (message_tx, message_rx) = mpsc::channel(1);
 
@@ -135,6 +137,7 @@ impl ConnectionManager {
             jwks,
             allowed_users,
             username_claim,
+            audience,
         );
 
         tokio::spawn(async move { actor.run().await });
@@ -299,6 +302,9 @@ struct EndpointActor {
     allowed_users: Option<Arc<Vec<String>>>,
     /// Name of the JWT claim to match against `allowed_users`.
     username_claim: String,
+    /// Optional expected audience value. When `Some`, the JWT's `aud` claim
+    /// must contain this string.
+    audience: Option<String>,
 }
 
 impl EndpointActor {
@@ -312,6 +318,7 @@ impl EndpointActor {
         jwks: Option<Arc<JwksCache>>,
         allowed_users: Option<Arc<Vec<String>>>,
         username_claim: String,
+        audience: Option<String>,
     ) -> Self {
         Self {
             endpoint,
@@ -322,6 +329,7 @@ impl EndpointActor {
             jwks,
             allowed_users,
             username_claim,
+            audience,
         }
     }
 
@@ -493,6 +501,7 @@ impl EndpointActor {
         let jwks_clone = self.jwks.clone();
         let allowed_users_clone = self.allowed_users.clone();
         let username_claim_clone = self.username_claim.clone();
+        let audience_clone = self.audience.clone();
         let document_handle_clone = self.document_handle.clone();
         tokio::spawn(async move {
             if let Err(err) = Self::handle_peer(
@@ -503,6 +512,7 @@ impl EndpointActor {
                     jwks: jwks_clone,
                     allowed_users: allowed_users_clone,
                     username_claim: username_claim_clone,
+                    audience: audience_clone,
                 },
             )
             .await
@@ -569,6 +579,7 @@ impl IrohConnection {
                 jwks,
                 allowed_users,
                 username_claim,
+                audience,
             } => {
                 let (mut send, mut recv) = conn.accept_bi().await?;
 
@@ -609,8 +620,8 @@ impl IrohConnection {
                     let jwt_str =
                         String::from_utf8(jwt_bytes).context("JWT token is not valid UTF-8")?;
 
-                    // Validate signature + expiry and extract the configured claim.
-                    let username = match jwks.validate_token(&jwt_str, &username_claim).await {
+                    // Validate signature + expiry + optional audience, then extract the configured claim.
+                    let username = match jwks.validate_token(&jwt_str, &username_claim, audience.as_deref()).await {
                         Ok(u) => u,
                         Err(err) => {
                             let _ = send.write_all(&[0u8]).await;
@@ -890,6 +901,7 @@ mod tests {
             jwks: None,
             allowed_users: None,
             username_claim: DEFAULT_USERNAME_CLAIM.to_owned(),
+            audience: None,
         };
         let joiner_auth = PeerAuth::YourPassphrase {
             passphrase: passphrase.clone(),
@@ -916,6 +928,7 @@ mod tests {
             jwks: None,
             allowed_users: None,
             username_claim: DEFAULT_USERNAME_CLAIM.to_owned(),
+            audience: None,
         };
         let joiner_auth = PeerAuth::YourPassphrase {
             passphrase: wrong_passphrase,
@@ -947,6 +960,7 @@ mod tests {
             jwks: Some(jwks),
             allowed_users: Some(allowed),
             username_claim: DEFAULT_USERNAME_CLAIM.to_owned(),
+            audience: None,
         };
         let joiner_auth = PeerAuth::YourPassphrase {
             passphrase: passphrase.clone(),
@@ -977,6 +991,7 @@ mod tests {
             jwks: Some(jwks),
             allowed_users: Some(allowed),
             username_claim: DEFAULT_USERNAME_CLAIM.to_owned(),
+            audience: None,
         };
         let joiner_auth = PeerAuth::YourPassphrase {
             passphrase: passphrase.clone(),
@@ -1007,6 +1022,7 @@ mod tests {
             jwks: Some(jwks),
             allowed_users: Some(allowed),
             username_claim: DEFAULT_USERNAME_CLAIM.to_owned(),
+            audience: None,
         };
         let joiner_auth = PeerAuth::YourPassphrase {
             passphrase: passphrase.clone(),
@@ -1039,6 +1055,7 @@ mod tests {
             jwks: Some(jwks),
             allowed_users: Some(allowed),
             username_claim: DEFAULT_USERNAME_CLAIM.to_owned(),
+            audience: None,
         };
         let joiner_auth = PeerAuth::YourPassphrase {
             passphrase: wrong_passphrase,
@@ -1071,6 +1088,7 @@ mod tests {
             jwks: Some(jwks),
             allowed_users: Some(allowed),
             username_claim: "preferred_username".to_owned(),
+            audience: None,
         };
         let joiner_auth = PeerAuth::YourPassphrase {
             passphrase: passphrase.clone(),
@@ -1102,6 +1120,7 @@ mod tests {
             jwks: Some(jwks),
             allowed_users: Some(allowed),
             username_claim: "preferred_username".to_owned(), // mismatch
+            audience: None,
         };
         let joiner_auth = PeerAuth::YourPassphrase {
             passphrase: passphrase.clone(),
@@ -1115,6 +1134,131 @@ mod tests {
 
         assert!(host_result.is_err(), "host should reject when claim name doesn't match");
         assert!(joiner_result.is_err(), "joiner should receive reject response");
+    }
+
+    // ── JWT mode — audience validation ────────────────────────────────────────
+
+    /// Build a JWT that includes an `aud` claim (single string or array).
+    fn sign_test_jwt_with_audience(
+        private: &RsaPrivateKey,
+        sub_value: &str,
+        aud: serde_json::Value,
+        exp_offset_secs: i64,
+    ) -> String {
+        use std::collections::HashMap;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut claims: HashMap<&str, serde_json::Value> = HashMap::new();
+        claims.insert(DEFAULT_USERNAME_CLAIM, serde_json::json!(sub_value));
+        claims.insert("aud", aud);
+        claims.insert("exp", serde_json::json!(now + exp_offset_secs));
+        let der = private.to_pkcs1_der().unwrap();
+        let key = EncodingKey::from_rsa_der(der.as_bytes());
+        encode(&Header::new(Algorithm::RS256), &claims, &key).unwrap()
+    }
+
+    #[tokio::test]
+    async fn handshake_jwt_audience_matches_accepted() {
+        let passphrase = SecretKey::generate(rand::rngs::OsRng);
+        let (private, public) = generate_test_rsa_keypair();
+        let token = sign_test_jwt_with_audience(
+            &private, "alice", serde_json::json!("my-app"), 3600,
+        );
+        let jwks = build_test_jwks_cache(&public).await;
+        let allowed = Arc::new(vec!["alice".to_string()]);
+
+        let (accepting_conn, connecting_conn) = make_connected_pair().await;
+
+        let host_auth = PeerAuth::MyPassphrase {
+            passphrase: passphrase.clone(),
+            jwks: Some(jwks),
+            allowed_users: Some(allowed),
+            username_claim: DEFAULT_USERNAME_CLAIM.to_owned(),
+            audience: Some("my-app".to_owned()),
+        };
+        let joiner_auth = PeerAuth::YourPassphrase {
+            passphrase: passphrase.clone(),
+            auth_token: Some(token),
+        };
+
+        let (host_result, joiner_result) = tokio::join!(
+            IrohConnection::new(accepting_conn, host_auth),
+            IrohConnection::new(connecting_conn, joiner_auth),
+        );
+
+        assert!(host_result.is_ok(), "host should accept token with matching audience");
+        assert!(joiner_result.is_ok(), "joiner should receive accept");
+    }
+
+    #[tokio::test]
+    async fn handshake_jwt_audience_mismatch_rejected() {
+        let passphrase = SecretKey::generate(rand::rngs::OsRng);
+        let (private, public) = generate_test_rsa_keypair();
+        let token = sign_test_jwt_with_audience(
+            &private, "alice", serde_json::json!("other-app"), 3600,
+        );
+        let jwks = build_test_jwks_cache(&public).await;
+        let allowed = Arc::new(vec!["alice".to_string()]);
+
+        let (accepting_conn, connecting_conn) = make_connected_pair().await;
+
+        let host_auth = PeerAuth::MyPassphrase {
+            passphrase: passphrase.clone(),
+            jwks: Some(jwks),
+            allowed_users: Some(allowed),
+            username_claim: DEFAULT_USERNAME_CLAIM.to_owned(),
+            audience: Some("my-app".to_owned()),
+        };
+        let joiner_auth = PeerAuth::YourPassphrase {
+            passphrase: passphrase.clone(),
+            auth_token: Some(token),
+        };
+
+        let (host_result, joiner_result) = tokio::join!(
+            IrohConnection::new(accepting_conn, host_auth),
+            IrohConnection::new(connecting_conn, joiner_auth),
+        );
+
+        assert!(host_result.is_err(), "host should reject token with wrong audience");
+        assert!(joiner_result.is_err(), "joiner should receive reject response");
+    }
+
+    #[tokio::test]
+    async fn handshake_jwt_audience_array_contains_required_accepted() {
+        let passphrase = SecretKey::generate(rand::rngs::OsRng);
+        let (private, public) = generate_test_rsa_keypair();
+        let token = sign_test_jwt_with_audience(
+            &private,
+            "alice",
+            serde_json::json!(["other-app", "my-app"]),
+            3600,
+        );
+        let jwks = build_test_jwks_cache(&public).await;
+        let allowed = Arc::new(vec!["alice".to_string()]);
+
+        let (accepting_conn, connecting_conn) = make_connected_pair().await;
+
+        let host_auth = PeerAuth::MyPassphrase {
+            passphrase: passphrase.clone(),
+            jwks: Some(jwks),
+            allowed_users: Some(allowed),
+            username_claim: DEFAULT_USERNAME_CLAIM.to_owned(),
+            audience: Some("my-app".to_owned()),
+        };
+        let joiner_auth = PeerAuth::YourPassphrase {
+            passphrase: passphrase.clone(),
+            auth_token: Some(token),
+        };
+
+        let (host_result, joiner_result) = tokio::join!(
+            IrohConnection::new(accepting_conn, host_auth),
+            IrohConnection::new(connecting_conn, joiner_auth),
+        );
+
+        assert!(host_result.is_ok(), "host should accept token whose aud array contains required value");
+        assert!(joiner_result.is_ok(), "joiner should receive accept");
     }
 }
 

@@ -101,6 +101,11 @@ pub enum Commands {
         /// Common alternatives: preferred_username, email, azp.
         #[arg(long)]
         username_claim: Option<String>,
+        /// Expected audience value. When set, the JWT's `aud` claim must contain
+        /// this string, otherwise the connection is rejected.
+        /// The `aud` claim may be a single string or a list of strings per RFC 7519.
+        #[arg(long)]
+        audience: Option<String>,
         #[command(flatten)]
         shared_flags: ShareJoinFlags,
     },

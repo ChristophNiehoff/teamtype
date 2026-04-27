@@ -73,12 +73,21 @@ impl JwksCache {
 
     /// Validate an RS256 JWT and return the value of `claim_name` on success.
     ///
-    /// The claim value must be a JSON string. Returns an error if the claim is
-    /// absent, not a string, or if signature / expiry validation fails.
+    /// - **`claim_name`**: The JWT claim whose value is returned (e.g. `"sub"`,
+    ///   `"preferred_username"`). Returns an error if absent or not a string.
+    /// - **`required_audience`**: When `Some`, the token's `aud` claim must
+    ///   contain this value. The `aud` claim may be a single string or a list
+    ///   of strings (RFC 7519 §4.1.3). Returns an error if the audience is
+    ///   absent or does not contain the required value.
     ///
     /// If the JWKS cache is empty, this will call [`Self::refresh`] first.
     /// The token's `exp` claim is validated automatically.
-    pub async fn validate_token(&self, token: &str, claim_name: &str) -> Result<String> {
+    pub async fn validate_token(
+        &self,
+        token: &str,
+        claim_name: &str,
+        required_audience: Option<&str>,
+    ) -> Result<String> {
         // Ensure the cache is populated.
         if self.keys.read().await.is_none() {
             self.refresh().await?;
@@ -124,8 +133,12 @@ impl JwksCache {
 
         let mut validation = Validation::new(Algorithm::RS256);
         validation.validate_exp = true;
-        // We don't require an `aud` claim; the allow-list check on the
-        // configured username claim is the authorization mechanism.
+
+        // Audience validation is handled manually after decoding (see below)
+        // because jsonwebtoken's built-in audience check does not reject tokens
+        // that are entirely missing the `aud` claim. We disable the built-in
+        // check and perform our own that correctly handles missing, single-string,
+        // and array-of-strings forms per RFC 7519 §4.1.3.
         validation.validate_aud = false;
 
         // Decode into a generic map so we can look up any claim by name at
@@ -133,6 +146,30 @@ impl JwksCache {
         let token_data =
             decode::<HashMap<String, Value>>(token, &decoding_key, &validation)
                 .context("JWT validation failed")?;
+
+        // jsonwebtoken's set_audience() only rejects aud mismatches; it does
+        // not reject tokens that are missing the aud claim entirely. When an
+        // audience is required, we enforce its presence manually.
+        if let Some(required_aud) = required_audience {
+            let aud_value = token_data
+                .claims
+                .get("aud")
+                .ok_or_else(|| anyhow!("JWT is missing the required 'aud' claim"))?;
+
+            let aud_matches = match aud_value {
+                Value::String(s) => s == required_aud,
+                Value::Array(arr) => arr
+                    .iter()
+                    .any(|v| v.as_str() == Some(required_aud)),
+                _ => false,
+            };
+
+            if !aud_matches {
+                bail!(
+                    "JWT 'aud' claim does not contain the required audience '{required_aud}'"
+                );
+            }
+        }
 
         let value = token_data
             .claims
@@ -277,7 +314,7 @@ mod tests {
         let token = sign_jwt(&private, "sub", "alice", 3600, None);
         let cache = cache_with_jwks(build_jwks_json(&public, None)).await;
 
-        let value = cache.validate_token(&token, "sub").await.unwrap();
+        let value = cache.validate_token(&token, "sub", None).await.unwrap();
         assert_eq!(value, "alice");
     }
 
@@ -288,7 +325,7 @@ mod tests {
         let cache = cache_with_jwks(build_jwks_json(&public, None)).await;
 
         let value = cache
-            .validate_token(&token, "preferred_username")
+            .validate_token(&token, "preferred_username", None)
             .await
             .unwrap();
         assert_eq!(value, "alice");
@@ -301,7 +338,7 @@ mod tests {
         let token = sign_jwt(&private, "sub", "alice", 3600, None);
         let cache = cache_with_jwks(build_jwks_json(&public, None)).await;
 
-        let result = cache.validate_token(&token, "preferred_username").await;
+        let result = cache.validate_token(&token, "preferred_username", None).await;
         assert!(result.is_err(), "Expected missing claim to be rejected");
     }
 
@@ -311,7 +348,7 @@ mod tests {
         let token = sign_jwt(&private, "sub", "bob", 3600, Some("key-1"));
         let cache = cache_with_jwks(build_jwks_json(&public, Some("key-1"))).await;
 
-        let value = cache.validate_token(&token, "sub").await.unwrap();
+        let value = cache.validate_token(&token, "sub", None).await.unwrap();
         assert_eq!(value, "bob");
     }
 
@@ -322,7 +359,7 @@ mod tests {
         let token = sign_jwt(&private, "sub", "alice", -3600, None);
         let cache = cache_with_jwks(build_jwks_json(&public, None)).await;
 
-        let result = cache.validate_token(&token, "sub").await;
+        let result = cache.validate_token(&token, "sub", None).await;
         assert!(result.is_err(), "Expected expired token to be rejected");
     }
 
@@ -334,7 +371,7 @@ mod tests {
         let token = sign_jwt(&private, "sub", "alice", 3600, Some("key-1"));
         let cache = cache_with_jwks(build_jwks_json(&other_public, Some("key-2"))).await;
 
-        let result = cache.validate_token(&token, "sub").await;
+        let result = cache.validate_token(&token, "sub", None).await;
         assert!(result.is_err(), "Expected wrong-kid token to be rejected");
     }
 
@@ -346,8 +383,111 @@ mod tests {
         let token = sign_jwt(&private, "sub", "alice", 3600, None);
         let cache = cache_with_jwks(build_jwks_json(&other_public, None)).await;
 
-        let result = cache.validate_token(&token, "sub").await;
+        let result = cache.validate_token(&token, "sub", None).await;
         assert!(result.is_err(), "Expected signature mismatch to be rejected");
+    }
+
+    // ── audience validation ────────────────────────────────────────────────────
+
+    /// Sign a JWT that includes an `aud` claim.
+    fn sign_jwt_with_audience(
+        private: &RsaPrivateKey,
+        sub_value: &str,
+        aud: serde_json::Value, // either a string or array of strings
+        exp_offset_secs: i64,
+    ) -> String {
+        use std::collections::HashMap;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut claims: HashMap<&str, serde_json::Value> = HashMap::new();
+        claims.insert("sub", serde_json::json!(sub_value));
+        claims.insert("aud", aud);
+        claims.insert("exp", serde_json::json!(now + exp_offset_secs));
+        let der = private.to_pkcs1_der().unwrap();
+        let key = EncodingKey::from_rsa_der(der.as_bytes());
+        encode(&Header::new(Algorithm::RS256), &claims, &key).expect("Failed to sign JWT")
+    }
+
+    #[tokio::test]
+    async fn audience_not_configured_token_without_aud_accepted() {
+        // When no audience is required, tokens without `aud` are accepted.
+        let (private, public) = generate_rsa_keypair();
+        let token = sign_jwt(&private, "sub", "alice", 3600, None);
+        let cache = cache_with_jwks(build_jwks_json(&public, None)).await;
+
+        let result = cache.validate_token(&token, "sub", None).await;
+        assert!(result.is_ok(), "Token without aud should be accepted when no audience configured");
+    }
+
+    #[tokio::test]
+    async fn audience_string_matches_accepted() {
+        // Token with `aud` as a single string matching the required audience.
+        let (private, public) = generate_rsa_keypair();
+        let token = sign_jwt_with_audience(
+            &private, "alice", serde_json::json!("my-client"), 3600,
+        );
+        let cache = cache_with_jwks(build_jwks_json(&public, None)).await;
+
+        let result = cache.validate_token(&token, "sub", Some("my-client")).await;
+        assert!(result.is_ok(), "Matching single-string audience should be accepted");
+    }
+
+    #[tokio::test]
+    async fn audience_array_contains_required_accepted() {
+        // Token with `aud` as an array that includes the required audience.
+        let (private, public) = generate_rsa_keypair();
+        let token = sign_jwt_with_audience(
+            &private,
+            "alice",
+            serde_json::json!(["other-client", "my-client"]),
+            3600,
+        );
+        let cache = cache_with_jwks(build_jwks_json(&public, None)).await;
+
+        let result = cache.validate_token(&token, "sub", Some("my-client")).await;
+        assert!(result.is_ok(), "Array audience containing required value should be accepted");
+    }
+
+    #[tokio::test]
+    async fn audience_string_does_not_match_rejected() {
+        // Token with `aud` as a single string that doesn't match.
+        let (private, public) = generate_rsa_keypair();
+        let token = sign_jwt_with_audience(
+            &private, "alice", serde_json::json!("other-client"), 3600,
+        );
+        let cache = cache_with_jwks(build_jwks_json(&public, None)).await;
+
+        let result = cache.validate_token(&token, "sub", Some("my-client")).await;
+        assert!(result.is_err(), "Non-matching single-string audience should be rejected");
+    }
+
+    #[tokio::test]
+    async fn audience_array_does_not_contain_required_rejected() {
+        // Token with `aud` array that doesn't include the required audience.
+        let (private, public) = generate_rsa_keypair();
+        let token = sign_jwt_with_audience(
+            &private,
+            "alice",
+            serde_json::json!(["other-client", "another-client"]),
+            3600,
+        );
+        let cache = cache_with_jwks(build_jwks_json(&public, None)).await;
+
+        let result = cache.validate_token(&token, "sub", Some("my-client")).await;
+        assert!(result.is_err(), "Array audience not containing required value should be rejected");
+    }
+
+    #[tokio::test]
+    async fn audience_required_but_token_has_no_aud_rejected() {
+        // When audience is required, tokens without `aud` claim are rejected.
+        let (private, public) = generate_rsa_keypair();
+        let token = sign_jwt(&private, "sub", "alice", 3600, None); // no aud
+        let cache = cache_with_jwks(build_jwks_json(&public, None)).await;
+
+        let result = cache.validate_token(&token, "sub", Some("my-client")).await;
+        assert!(result.is_err(), "Token without aud should be rejected when audience is required");
     }
 
     // ── JWKS deserialization ───────────────────────────────────────────────────
