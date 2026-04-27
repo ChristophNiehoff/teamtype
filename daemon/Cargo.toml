@@ -71,13 +71,15 @@ clap_mangen = "0.2"
 [dependencies]
 anyhow = "1.0.81"
 async-trait = "0.1.88"
+jsonwebtoken = "9"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 automerge = "0.7.3"
 clap = { version = "4.5.3", features = ["derive", "env"], optional = true }
 constant_time_eq = "0.4.2"
 derive_more = { version = "2.0.1", features = ["as_ref", "deref", "display"] }
 dissimilar = "1.0.9"
 futures = { version = "0.3.30", default-features = false }
-git2 = { version = "0.20.2", default-features = false }
+git2 = { version = "0.20.2", default-features = false, features = ["vendored-libgit2"] }
 ignore = "0.4.22"
 iroh = "0.35.0"
 magic-wormhole = "0.7.6"
@@ -110,7 +112,9 @@ version = "1"
 features = ["rt", "io-std", "io-util", "macros", "net", "time"]
 
 [dev-dependencies]
+base64 = "0.22"
 pretty_assertions = "1.4.0"
+rsa = "0.9"
 tracing-test = "0.2.4"
 
 # Stripping symbols (not debuginfo) reduces binary size by ~1.5x.

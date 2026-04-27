@@ -49,6 +49,28 @@ To run your own infrastructure, see:
 - **iroh relay server**: [github.com/n0-computer/iroh](https://github.com/n0-computer/iroh) (`iroh-relay` crate)
 - **pkarr relay server**: [github.com/Nuhvi/pkarr](https://github.com/Nuhvi/pkarr)
 
+## Access control
+
+By default, anyone who knows a session's secret address can connect to it. For deployments that need to restrict access to specific users — for example a cloud peer used by a team — you can enable JWT-based allow-list authentication.
+
+The host specifies which users are allowed and where to fetch the signing keys:
+
+```bash
+teamtype share \
+  --allowed-users alice,bob \
+  --jwks-url https://keycloak.example.com/realms/myrealm/protocol/openid-connect/certs
+```
+
+Each joiner obtains a JWT from the identity provider and passes it when connecting:
+
+```bash
+teamtype join --auth-token eyJhbGciOiJSUzI1NiIs...
+```
+
+The host validates the token's signature and checks the `preferred_username` claim against the allow list. Connections from unknown or expired tokens are rejected before any document synchronization begins.
+
+Full details and configuration options are described in the [Configuration](configuration.md#jwt-allow-list-authentication) chapter.
+
 ## Cloud peer
 
 When you want to have an "always online" host, such that every user can connect to it at the time of their liking, let's say you're collaborating in a group on [taking notes](shared-notes.md).

@@ -975,6 +975,8 @@ impl Daemon {
             &base_dir,
             app_config.relay.clone(),
             app_config.discovery.clone(),
+            app_config.allowed_users.clone(),
+            app_config.jwks_url.clone(),
         )
         .await
         .expect("Failed to start connection manager");
@@ -992,7 +994,7 @@ impl Daemon {
         }
         if let Some(config::Peer::SecretAddress(ref secret_address)) = app_config.peer {
             connection_manager
-                .connect(secret_address.clone())
+                .connect(secret_address.clone(), app_config.auth_token.clone())
                 .await
                 .context("Failed to connect to specified peer")?;
         }

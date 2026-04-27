@@ -48,6 +48,14 @@ pub struct AppConfig {
     // Whether to sync version control directories like .git, .jj, ...
     pub sync_vcs: bool,
     pub username: Option<String>,
+    /// Allowed JWT `sub` values for incoming connections (host side only).
+    /// When set, joiners must present a valid JWT whose `sub` is in this list.
+    pub allowed_users: Option<Vec<String>>,
+    /// JWKS URL for verifying JWT signatures (host side only).
+    /// Required when `allowed_users` is set.
+    pub jwks_url: Option<String>,
+    /// JWT bearer token to present when connecting to a host (joiner side only).
+    pub auth_token: Option<String>,
 }
 
 impl AppConfig {
@@ -111,6 +119,16 @@ impl AppConfig {
                 .or_else(|| general_section.get("discovery").map(ToString::to_string)),
             sync_vcs: app_config_cli.sync_vcs,
             username: Some(username),
+            // allowed_users and jwks_url are host-only and only come from the CLI,
+            // not from the config file.
+            allowed_users: app_config_cli.allowed_users,
+            jwks_url: app_config_cli.jwks_url,
+            // auth_token can optionally be stored in the config file for convenience.
+            auth_token: app_config_cli.auth_token.or_else(|| {
+                general_section
+                    .get("auth_token")
+                    .map(ToString::to_string)
+            }),
         }
     }
 
@@ -469,5 +487,97 @@ mod tests {
             result.discovery.as_deref(),
             Some("https://discovery.file.example.com/pkarr")
         );
+    }
+
+    // ── auth_token ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn auth_token_absent_when_neither_cli_nor_config_file_set() {
+        let dir = tempdir().unwrap();
+        let result = AppConfig::from_config_file_and_cli(cli_config(dir.path()));
+        assert_eq!(result.auth_token, None);
+    }
+
+    #[test]
+    fn auth_token_taken_from_cli() {
+        let dir = tempdir().unwrap();
+        let mut config = cli_config(dir.path());
+        config.auth_token = Some("token-from-cli".to_string());
+
+        let result = AppConfig::from_config_file_and_cli(config);
+        assert_eq!(result.auth_token.as_deref(), Some("token-from-cli"));
+    }
+
+    #[test]
+    fn auth_token_taken_from_config_file() {
+        let dir = tempdir().unwrap();
+        write_teamtype_config(dir.path(), "auth_token = token-from-file\n");
+
+        let result = AppConfig::from_config_file_and_cli(cli_config(dir.path()));
+        assert_eq!(result.auth_token.as_deref(), Some("token-from-file"));
+    }
+
+    #[test]
+    fn auth_token_cli_takes_precedence_over_config_file() {
+        let dir = tempdir().unwrap();
+        write_teamtype_config(dir.path(), "auth_token = token-from-file\n");
+
+        let mut config = cli_config(dir.path());
+        config.auth_token = Some("token-from-cli".to_string());
+
+        let result = AppConfig::from_config_file_and_cli(config);
+        assert_eq!(result.auth_token.as_deref(), Some("token-from-cli"));
+    }
+
+    // ── allowed_users / jwks_url ───────────────────────────────────────────────
+
+    #[test]
+    fn allowed_users_absent_by_default() {
+        let dir = tempdir().unwrap();
+        let result = AppConfig::from_config_file_and_cli(cli_config(dir.path()));
+        assert_eq!(result.allowed_users, None);
+    }
+
+    #[test]
+    fn jwks_url_absent_by_default() {
+        let dir = tempdir().unwrap();
+        let result = AppConfig::from_config_file_and_cli(cli_config(dir.path()));
+        assert_eq!(result.jwks_url, None);
+    }
+
+    #[test]
+    fn allowed_users_taken_from_cli() {
+        let dir = tempdir().unwrap();
+        let mut config = cli_config(dir.path());
+        config.allowed_users = Some(vec!["alice".to_string(), "bob".to_string()]);
+
+        let result = AppConfig::from_config_file_and_cli(config);
+        assert_eq!(
+            result.allowed_users.as_deref(),
+            Some(["alice".to_string(), "bob".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn jwks_url_taken_from_cli() {
+        let dir = tempdir().unwrap();
+        let mut config = cli_config(dir.path());
+        config.jwks_url = Some("https://keycloak.example.com/certs".to_string());
+
+        let result = AppConfig::from_config_file_and_cli(config);
+        assert_eq!(
+            result.jwks_url.as_deref(),
+            Some("https://keycloak.example.com/certs")
+        );
+    }
+
+    #[test]
+    fn allowed_users_not_read_from_config_file() {
+        // allowed_users is intentionally CLI-only; the config file is ignored for it.
+        let dir = tempdir().unwrap();
+        // Even if someone puts it in the config file, it should not be picked up
+        // (there is no merge logic for it from the file).
+        let result = AppConfig::from_config_file_and_cli(cli_config(dir.path()));
+        assert_eq!(result.allowed_users, None);
     }
 }

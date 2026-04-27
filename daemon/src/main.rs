@@ -78,6 +78,8 @@ async fn main() -> Result<()> {
                 Commands::Share {
                     init,
                     no_join_code,
+                    allowed_users,
+                    jwks_url,
                     shared_flags:
                         ShareJoinFlags {
                             magic_wormhole_relay,
@@ -102,8 +104,18 @@ async fn main() -> Result<()> {
                         discovery,
                         sync_vcs,
                         username,
+                        allowed_users,
+                        jwks_url,
+                        auth_token: None,
                     };
                     app_config = AppConfig::from_config_file_and_cli(app_config_cli);
+
+                    // Validate that --allowed-users and --jwks-url are always used together.
+                    teamtype::auth::validate_auth_config(
+                        &app_config.allowed_users,
+                        &app_config.jwks_url,
+                    )
+                    .context("Invalid authentication configuration")?;
 
                     // Because of the "share" subcommand, explicitly don't connect anywhere.
                     app_config.peer = None;
@@ -117,6 +129,7 @@ async fn main() -> Result<()> {
                             discovery,
                             sync_vcs,
                             username,
+                            auth_token,
                             ..
                         },
                     ..
@@ -131,6 +144,9 @@ async fn main() -> Result<()> {
                         discovery,
                         sync_vcs,
                         username,
+                        allowed_users: None,
+                        jwks_url: None,
+                        auth_token,
                     };
 
                     app_config = AppConfig::from_config_file_and_cli(app_config_cli);

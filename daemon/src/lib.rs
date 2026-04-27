@@ -3,6 +3,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+pub mod auth;
 pub mod cli_ask;
 pub mod config;
 pub mod daemon;

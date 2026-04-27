@@ -7,8 +7,9 @@
 //! This module provides a [`ConnectionManager`], which can be used to connect to other daemons.
 
 use self::sync::{Connection, PeerMessage, SyncActor};
+use crate::auth::JwksCache;
 use crate::daemon::DocumentActorHandle;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use iroh::discovery::{
     ConcurrentDiscovery,
@@ -23,6 +24,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
@@ -55,9 +57,34 @@ impl FromStr for SecretAddress {
     }
 }
 
+/// Sentinel error returned to the joiner when the host explicitly rejects the
+/// connection due to a failed JWT check (wrong user, expired token, etc.).
+/// Unlike transient network errors, this should not trigger a reconnect.
+#[derive(Debug)]
+struct AuthRejected;
+
+impl std::fmt::Display for AuthRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Host rejected connection: JWT token missing, expired, or user not in allow list")
+    }
+}
+
+impl std::error::Error for AuthRejected {}
+
 enum PeerAuth {
-    MyPassphrase(SecretKey),
-    YourPassphrase(SecretKey),
+    /// Accepting side: verify the passphrase and, when JWT auth is configured,
+    /// also validate the JWT and check the subject against the allow list.
+    MyPassphrase {
+        passphrase: SecretKey,
+        jwks: Option<Arc<JwksCache>>,
+        allowed_users: Option<Arc<Vec<String>>>,
+    },
+    /// Connecting side: send the passphrase and, when an auth token is present,
+    /// also send the JWT and wait for the host's accept/reject response.
+    YourPassphrase {
+        passphrase: SecretKey,
+        auth_token: Option<String>,
+    },
 }
 
 pub struct ConnectionManager {
@@ -71,6 +98,8 @@ impl ConnectionManager {
         base_dir: &Path,
         relay: Option<String>,
         discovery: Option<String>,
+        allowed_users: Option<Vec<String>>,
+        jwks_url: Option<String>,
     ) -> Result<Self> {
         let (message_tx, message_rx) = mpsc::channel(1);
 
@@ -78,12 +107,28 @@ impl ConnectionManager {
 
         let secret_address = format!("{}#{}", endpoint.node_id(), my_passphrase);
 
+        // If a JWKS URL is provided, fetch the keys eagerly so that startup fails
+        // fast if the JWKS endpoint is unreachable.
+        let jwks = if let Some(url) = jwks_url {
+            let cache = Arc::new(JwksCache::new(url));
+            cache
+                .refresh()
+                .await
+                .context("Failed to fetch JWKS keys on startup")?;
+            Some(cache)
+        } else {
+            None
+        };
+        let allowed_users = allowed_users.map(Arc::new);
+
         let mut actor = EndpointActor::new(
             endpoint,
             message_rx,
             message_tx.clone(),
             document_handle,
             my_passphrase,
+            jwks,
+            allowed_users,
         );
 
         tokio::spawn(async move { actor.run().await });
@@ -99,7 +144,7 @@ impl ConnectionManager {
         &self.secret_address
     }
 
-    pub async fn connect(&self, secret_address: String) -> Result<()> {
+    pub async fn connect(&self, secret_address: String, auth_token: Option<String>) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
 
         self.message_tx
@@ -107,6 +152,7 @@ impl ConnectionManager {
                 secret_address: SecretAddress::from_str(&secret_address)?,
                 response_tx: Some(response_tx),
                 previous_attempts: 0,
+                auth_token,
             })
             .await
             .expect("EndpointActor task has been killed");
@@ -228,6 +274,8 @@ enum EndpointMessage {
         response_tx: Option<oneshot::Sender<Result<()>>>,
         // How many times have we already attempted to connect?
         previous_attempts: usize,
+        // Optional JWT token to send to the host for allow-list authentication.
+        auth_token: Option<String>,
     },
 }
 
@@ -239,15 +287,22 @@ struct EndpointActor {
     message_tx: mpsc::Sender<EndpointMessage>,
     document_handle: DocumentActorHandle,
     my_passphrase: SecretKey,
+    /// JWKS cache for validating incoming JWT tokens (host side, optional).
+    jwks: Option<Arc<JwksCache>>,
+    /// Allow list of permitted JWT `sub` values (host side, optional).
+    allowed_users: Option<Arc<Vec<String>>>,
 }
 
 impl EndpointActor {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         endpoint: iroh::Endpoint,
         message_rx: mpsc::Receiver<EndpointMessage>,
         message_tx: mpsc::Sender<EndpointMessage>,
         document_handle: DocumentActorHandle,
         my_passphrase: SecretKey,
+        jwks: Option<Arc<JwksCache>>,
+        allowed_users: Option<Arc<Vec<String>>>,
     ) -> Self {
         Self {
             endpoint,
@@ -255,6 +310,8 @@ impl EndpointActor {
             message_tx,
             document_handle,
             my_passphrase,
+            jwks,
+            allowed_users,
         }
     }
 
@@ -264,6 +321,7 @@ impl EndpointActor {
                 secret_address,
                 response_tx,
                 previous_attempts,
+                auth_token,
             } => {
                 let node_addr = secret_address.node_addr.clone();
                 let connect_result = self.endpoint.connect(node_addr, ALPN).await;
@@ -275,9 +333,14 @@ impl EndpointActor {
                                 .send(Err(err))
                                 .expect("Connect receiver dropped");
                         }
-                        Self::reconnect(self.message_tx.clone(), secret_address, previous_attempts)
-                            .await
-                            .expect("Failed to initiate reconnection");
+                        Self::reconnect(
+                            self.message_tx.clone(),
+                            secret_address,
+                            previous_attempts,
+                            auth_token,
+                        )
+                        .await
+                        .expect("Failed to initiate reconnection");
                         // Not really Ok, but Ok enough.
                         return Ok(());
                     }
@@ -289,25 +352,53 @@ impl EndpointActor {
                         .expect("Connection should have a node ID")
                 );
 
-                if let Some(response_tx) = response_tx {
-                    response_tx.send(Ok(())).expect("Connect receiver dropped");
-                }
-
                 let document_handle_clone = self.document_handle.clone();
                 let message_tx_clone = self.message_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = Self::handle_peer(
+                    let result = Self::handle_peer(
                         document_handle_clone,
                         conn,
-                        PeerAuth::YourPassphrase(secret_address.passphrase.clone()),
+                        PeerAuth::YourPassphrase {
+                            passphrase: secret_address.passphrase.clone(),
+                            auth_token: auth_token.clone(),
+                        },
                     )
-                    .await
-                    {
-                        debug!("Error while handling a peer: {:?}", err);
+                    .await;
+
+                    match result {
+                        Err(ref err) if err.downcast_ref::<AuthRejected>().is_some() => {
+                            // The host explicitly rejected our JWT. Retrying
+                            // would fail for the same reason. Signal the initial
+                            // connect() caller so the process exits via the
+                            // normal error path, or exit directly if this is a
+                            // reconnect attempt (no response_tx).
+                            tracing::error!("{err}");
+                            if let Some(tx) = response_tx {
+                                let _ = tx.send(Err(anyhow!(AuthRejected)));
+                            } else {
+                                std::process::exit(1);
+                            }
+                        }
+                        Err(err) => {
+                            // Notify the initial caller of the transient failure,
+                            // then schedule a reconnect.
+                            if let Some(tx) = response_tx {
+                                let _ = tx.send(Err(anyhow!("Connection failed: {err}")));
+                            }
+                            debug!("Error while handling a peer: {:?}", err);
+                            Self::reconnect(message_tx_clone, secret_address, 0, auth_token)
+                                .await
+                                .expect("Failed to initiate reconnection");
+                        }
+                        Ok(()) => {
+                            if let Some(tx) = response_tx {
+                                tx.send(Ok(())).expect("Connect receiver dropped");
+                            }
+                            Self::reconnect(message_tx_clone, secret_address, 0, auth_token)
+                                .await
+                                .expect("Failed to initiate reconnection");
+                        }
                     }
-                    Self::reconnect(message_tx_clone, secret_address, 0)
-                        .await
-                        .expect("Failed to initiate reconnection");
                 });
             }
         }
@@ -318,6 +409,7 @@ impl EndpointActor {
         message_tx: mpsc::Sender<EndpointMessage>,
         secret_address: SecretAddress,
         previous_attempts: usize,
+        auth_token: Option<String>,
     ) -> Result<()> {
         // Only log at "info" level if this is the first reconnection attempt.
         if previous_attempts == 0 {
@@ -338,6 +430,7 @@ impl EndpointActor {
                 secret_address,
                 response_tx: None,
                 previous_attempts: previous_attempts + 1,
+                auth_token,
             })
             .await?;
         Ok(())
@@ -387,12 +480,18 @@ impl EndpointActor {
         info!("Peer connected: {}", &node_id);
 
         let my_passphrase_clone = self.my_passphrase.clone();
+        let jwks_clone = self.jwks.clone();
+        let allowed_users_clone = self.allowed_users.clone();
         let document_handle_clone = self.document_handle.clone();
         tokio::spawn(async move {
             if let Err(err) = Self::handle_peer(
                 document_handle_clone,
                 conn,
-                PeerAuth::MyPassphrase(my_passphrase_clone),
+                PeerAuth::MyPassphrase {
+                    passphrase: my_passphrase_clone,
+                    jwks: jwks_clone,
+                    allowed_users: allowed_users_clone,
+                },
             )
             .await
             {
@@ -423,23 +522,96 @@ struct IrohConnection {
 impl IrohConnection {
     async fn new(conn: iroh::endpoint::Connection, auth: PeerAuth) -> Result<Self> {
         let (send, receive) = match auth {
-            PeerAuth::YourPassphrase(passphrase) => {
-                let (mut send, recv) = conn.open_bi().await?;
+            PeerAuth::YourPassphrase {
+                passphrase,
+                auth_token,
+            } => {
+                let (mut send, mut recv) = conn.open_bi().await?;
 
+                // Send passphrase (existing protocol).
                 send.write_all(&passphrase.to_bytes()).await?;
+
+                if let Some(token) = auth_token {
+                    // Send JWT length + JWT bytes.
+                    let jwt_bytes = token.as_bytes();
+                    let jwt_len =
+                        u32::try_from(jwt_bytes.len()).context("JWT token length overflows u32")?;
+                    send.write_all(&jwt_len.to_be_bytes()).await?;
+                    send.write_all(jwt_bytes).await?;
+
+                    // Read the host's accept (0x01) or reject (0x00) response.
+                    let mut response = [0u8; 1];
+                    recv.read_exact(&mut response).await?;
+                    if response[0] != 1 {
+                        // Use a typed error so the caller can distinguish an
+                        // explicit auth rejection from a transient network error
+                        // and avoid attempting to reconnect.
+                        return Err(anyhow!(AuthRejected));
+                    }
+                }
 
                 (send, recv)
             }
-            PeerAuth::MyPassphrase(passphrase) => {
-                let (send, mut recv) = conn.accept_bi().await?;
+            PeerAuth::MyPassphrase {
+                passphrase,
+                jwks,
+                allowed_users,
+            } => {
+                let (mut send, mut recv) = conn.accept_bi().await?;
 
+                // Read and verify passphrase (existing protocol).
                 let mut received_passphrase = [0; 32];
                 recv.read_exact(&mut received_passphrase).await?;
 
                 // Guard against timing attacks.
-                if !constant_time_eq::constant_time_eq(&received_passphrase, &passphrase.to_bytes())
-                {
+                if !constant_time_eq::constant_time_eq(
+                    &received_passphrase,
+                    &passphrase.to_bytes(),
+                ) {
+                    // Send reject byte when JWT mode is active so the joiner doesn't
+                    // hang waiting for a response that will never come.
+                    if jwks.is_some() {
+                        let _ = send.write_all(&[0u8]).await;
+                    }
                     bail!("Peer provided incorrect passphrase.");
+                }
+
+                // JWT validation (only when allow-list is configured).
+                if let (Some(jwks), Some(allowed_users)) = (&jwks, &allowed_users) {
+                    // Read JWT length (4 bytes big-endian).
+                    let mut jwt_len_buf = [0u8; 4];
+                    recv.read_exact(&mut jwt_len_buf).await?;
+                    let jwt_len = u32::from_be_bytes(jwt_len_buf) as usize;
+
+                    // Sanity-check the length to avoid large allocations from a
+                    // malicious/misconfigured peer.
+                    const MAX_JWT_BYTES: usize = 16_384;
+                    if jwt_len > MAX_JWT_BYTES {
+                        let _ = send.write_all(&[0u8]).await;
+                        bail!("JWT token too large ({jwt_len} bytes, max {MAX_JWT_BYTES})");
+                    }
+
+                    let mut jwt_bytes = vec![0u8; jwt_len];
+                    recv.read_exact(&mut jwt_bytes).await?;
+                    let jwt_str =
+                        String::from_utf8(jwt_bytes).context("JWT token is not valid UTF-8")?;
+
+                    // Validate signature + expiry and extract the subject claim.
+                    let sub = match jwks.validate_token(&jwt_str).await {
+                        Ok(sub) => sub,
+                        Err(err) => {
+                            let _ = send.write_all(&[0u8]).await;
+                            bail!("JWT validation failed: {err}");
+                        }
+                    };
+
+                    if !allowed_users.contains(&sub) {
+                        let _ = send.write_all(&[0u8]).await;
+                        bail!("User '{sub}' is not in the allow list");
+                    }
+
+                    info!("Authenticated peer: preferred_username={sub}");
+                    send.write_all(&[1u8]).await?;
                 }
 
                 (send, recv)
@@ -485,7 +657,7 @@ mod tests {
     /// Create a temp dir with the `.teamtype/` subdirectory that `get_keypair` expects.
     fn make_temp_base_dir() -> tempfile::TempDir {
         let dir = tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".teamtype")).unwrap();
+        fs::create_dir_all(dir.path().join(".teamtype")).unwrap();
         dir
     }
 
@@ -580,6 +752,278 @@ mod tests {
             "fully-custom endpoint should have discovery configured"
         );
         endpoint.close().await;
+    }
+
+    // ── JWT handshake tests ────────────────────────────────────────────────────
+    //
+    // These tests spin up two real iroh QUIC endpoints in-process and exercise
+    // the full auth handshake (passphrase + optional JWT) via `IrohConnection`.
+    //
+    // Because we need two endpoints to talk to each other directly (no relay),
+    // we build them both with `discovery_n0()` but then connect via the node
+    // address returned by `endpoint.node_addr()`, which includes direct socket
+    // addresses and avoids any network dependency.
+
+    use crate::auth::JwksCache;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use rsa::pkcs1::EncodeRsaPrivateKey as _;
+    use rsa::traits::PublicKeyParts as _;
+    use rsa::{RsaPrivateKey, RsaPublicKey};
+    use serde::Serialize;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // ── shared JWT test helpers ────────────────────────────────────────────────
+
+    fn generate_test_rsa_keypair() -> (RsaPrivateKey, RsaPublicKey) {
+        let mut rng = rand::thread_rng();
+        let private = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public = RsaPublicKey::from(&private);
+        (private, public)
+    }
+
+    fn build_test_jwks_json(public: &RsaPublicKey, kid: Option<&str>) -> serde_json::Value {
+        let n = URL_SAFE_NO_PAD.encode(public.n().to_bytes_be());
+        let e = URL_SAFE_NO_PAD.encode(public.e().to_bytes_be());
+        let mut key = serde_json::json!({ "kty": "RSA", "n": n, "e": e });
+        if let Some(kid) = kid {
+            key["kid"] = serde_json::json!(kid);
+        }
+        serde_json::json!({ "keys": [key] })
+    }
+
+    async fn build_test_jwks_cache(public: &RsaPublicKey) -> Arc<JwksCache> {
+        use crate::auth::tests_helpers::jwks_cache_from_value;
+        let jwks_json = build_test_jwks_json(public, None);
+        Arc::new(jwks_cache_from_value(jwks_json).await)
+    }
+
+    fn sign_test_jwt(private: &RsaPrivateKey, preferred_username: &str, exp_offset_secs: i64) -> String {
+        #[derive(Serialize)]
+        struct C {
+            preferred_username: String,
+            exp: i64,
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let der = private.to_pkcs1_der().unwrap();
+        let key = EncodingKey::from_rsa_der(der.as_bytes());
+        encode(
+            &Header::new(Algorithm::RS256),
+            &C { preferred_username: preferred_username.to_string(), exp: now + exp_offset_secs },
+            &key,
+        )
+        .unwrap()
+    }
+
+    /// Build two connected iroh endpoints. Returns (accepting_conn, connecting_conn).
+    async fn make_connected_pair() -> (iroh::endpoint::Connection, iroh::endpoint::Connection) {
+        // Acceptor endpoint
+        let acceptor = iroh::Endpoint::builder()
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+
+        // Connector endpoint
+        let connector = iroh::Endpoint::builder()
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+
+        let acceptor_addr = acceptor.node_addr().await.unwrap();
+
+        // Accept and connect concurrently.
+        let (accepting_conn, connecting_conn) = tokio::join!(
+            async {
+                acceptor
+                    .accept()
+                    .await
+                    .unwrap()
+                    .await
+                    .unwrap()
+            },
+            async {
+                connector
+                    .connect(acceptor_addr, ALPN)
+                    .await
+                    .unwrap()
+            }
+        );
+
+        (accepting_conn, connecting_conn)
+    }
+
+    // ── passphrase-only (legacy mode) ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn handshake_correct_passphrase_no_jwt_succeeds() {
+        let passphrase = SecretKey::generate(rand::rngs::OsRng);
+        let (accepting_conn, connecting_conn) = make_connected_pair().await;
+
+        let host_auth = PeerAuth::MyPassphrase {
+            passphrase: passphrase.clone(),
+            jwks: None,
+            allowed_users: None,
+        };
+        let joiner_auth = PeerAuth::YourPassphrase {
+            passphrase: passphrase.clone(),
+            auth_token: None,
+        };
+
+        let (host_result, joiner_result) = tokio::join!(
+            IrohConnection::new(accepting_conn, host_auth),
+            IrohConnection::new(connecting_conn, joiner_auth),
+        );
+
+        assert!(host_result.is_ok(), "host should accept correct passphrase");
+        assert!(joiner_result.is_ok(), "joiner should connect with correct passphrase");
+    }
+
+    #[tokio::test]
+    async fn handshake_wrong_passphrase_no_jwt_rejected() {
+        let passphrase = SecretKey::generate(rand::rngs::OsRng);
+        let wrong_passphrase = SecretKey::generate(rand::rngs::OsRng);
+        let (accepting_conn, connecting_conn) = make_connected_pair().await;
+
+        let host_auth = PeerAuth::MyPassphrase {
+            passphrase: passphrase.clone(),
+            jwks: None,
+            allowed_users: None,
+        };
+        let joiner_auth = PeerAuth::YourPassphrase {
+            passphrase: wrong_passphrase,
+            auth_token: None,
+        };
+
+        let (host_result, _joiner_result) = tokio::join!(
+            IrohConnection::new(accepting_conn, host_auth),
+            IrohConnection::new(connecting_conn, joiner_auth),
+        );
+
+        assert!(host_result.is_err(), "host should reject wrong passphrase");
+    }
+
+    // ── JWT mode ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn handshake_jwt_valid_user_in_allow_list_succeeds() {
+        let passphrase = SecretKey::generate(rand::rngs::OsRng);
+        let (private, public) = generate_test_rsa_keypair();
+        let token = sign_test_jwt(&private, "alice", 3600);
+        let jwks = build_test_jwks_cache(&public).await;
+        let allowed = Arc::new(vec!["alice".to_string()]);
+
+        let (accepting_conn, connecting_conn) = make_connected_pair().await;
+
+        let host_auth = PeerAuth::MyPassphrase {
+            passphrase: passphrase.clone(),
+            jwks: Some(jwks),
+            allowed_users: Some(allowed),
+        };
+        let joiner_auth = PeerAuth::YourPassphrase {
+            passphrase: passphrase.clone(),
+            auth_token: Some(token),
+        };
+
+        let (host_result, joiner_result) = tokio::join!(
+            IrohConnection::new(accepting_conn, host_auth),
+            IrohConnection::new(connecting_conn, joiner_auth),
+        );
+
+        assert!(host_result.is_ok(), "host should accept valid JWT for allowed user");
+        assert!(joiner_result.is_ok(), "joiner should receive accept");
+    }
+
+    #[tokio::test]
+    async fn handshake_jwt_user_not_in_allow_list_rejected() {
+        let passphrase = SecretKey::generate(rand::rngs::OsRng);
+        let (private, public) = generate_test_rsa_keypair();
+        let token = sign_test_jwt(&private, "eve", 3600); // not in allow list
+        let jwks = build_test_jwks_cache(&public).await;
+        let allowed = Arc::new(vec!["alice".to_string()]);
+
+        let (accepting_conn, connecting_conn) = make_connected_pair().await;
+
+        let host_auth = PeerAuth::MyPassphrase {
+            passphrase: passphrase.clone(),
+            jwks: Some(jwks),
+            allowed_users: Some(allowed),
+        };
+        let joiner_auth = PeerAuth::YourPassphrase {
+            passphrase: passphrase.clone(),
+            auth_token: Some(token),
+        };
+
+        let (host_result, joiner_result) = tokio::join!(
+            IrohConnection::new(accepting_conn, host_auth),
+            IrohConnection::new(connecting_conn, joiner_auth),
+        );
+
+        assert!(host_result.is_err(), "host should reject user not in allow list");
+        assert!(joiner_result.is_err(), "joiner should receive reject response");
+    }
+
+    #[tokio::test]
+    async fn handshake_jwt_expired_token_rejected() {
+        let passphrase = SecretKey::generate(rand::rngs::OsRng);
+        let (private, public) = generate_test_rsa_keypair();
+        let token = sign_test_jwt(&private, "alice", -3600); // expired
+        let jwks = build_test_jwks_cache(&public).await;
+        let allowed = Arc::new(vec!["alice".to_string()]);
+
+        let (accepting_conn, connecting_conn) = make_connected_pair().await;
+
+        let host_auth = PeerAuth::MyPassphrase {
+            passphrase: passphrase.clone(),
+            jwks: Some(jwks),
+            allowed_users: Some(allowed),
+        };
+        let joiner_auth = PeerAuth::YourPassphrase {
+            passphrase: passphrase.clone(),
+            auth_token: Some(token),
+        };
+
+        let (host_result, joiner_result) = tokio::join!(
+            IrohConnection::new(accepting_conn, host_auth),
+            IrohConnection::new(connecting_conn, joiner_auth),
+        );
+
+        assert!(host_result.is_err(), "host should reject expired token");
+        assert!(joiner_result.is_err(), "joiner should receive reject response");
+    }
+
+    #[tokio::test]
+    async fn handshake_jwt_wrong_passphrase_with_valid_jwt_rejected() {
+        // Even with a valid JWT, a wrong passphrase must still be rejected.
+        let passphrase = SecretKey::generate(rand::rngs::OsRng);
+        let wrong_passphrase = SecretKey::generate(rand::rngs::OsRng);
+        let (private, public) = generate_test_rsa_keypair();
+        let token = sign_test_jwt(&private, "alice", 3600);
+        let jwks = build_test_jwks_cache(&public).await;
+        let allowed = Arc::new(vec!["alice".to_string()]);
+
+        let (accepting_conn, connecting_conn) = make_connected_pair().await;
+
+        let host_auth = PeerAuth::MyPassphrase {
+            passphrase: passphrase.clone(),
+            jwks: Some(jwks),
+            allowed_users: Some(allowed),
+        };
+        let joiner_auth = PeerAuth::YourPassphrase {
+            passphrase: wrong_passphrase,
+            auth_token: Some(token),
+        };
+
+        let (host_result, _) = tokio::join!(
+            IrohConnection::new(accepting_conn, host_auth),
+            IrohConnection::new(connecting_conn, joiner_auth),
+        );
+
+        assert!(host_result.is_err(), "host should reject wrong passphrase even with valid JWT");
     }
 }
 

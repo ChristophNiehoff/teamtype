@@ -58,6 +58,10 @@ pub struct ShareJoinFlags {
     #[arg(long)]
     /// The name that others see next to your cursor. Defaults to your Git username.
     pub username: Option<String>,
+    /// JWT bearer token for authenticating with the host.
+    /// Required when the host is configured with --allowed-users.
+    #[arg(long)]
+    pub auth_token: Option<String>,
     /// Create a new temporary directory and use it as the shared directory.
     /// The temporary directory is removed on exit.
     /// The temporary directory is created in `$XDG_CACHE_DIR/teamtype/`,
@@ -81,6 +85,16 @@ pub enum Commands {
         /// Print the secret address. Useful for sharing with multiple people.
         #[arg(long)]
         show_secret_address: bool,
+        /// Comma-separated list of allowed `preferred_username` claim values.
+        /// When set, joining peers must present a valid JWT whose `preferred_username` is in this list.
+        /// Requires --jwks-url.
+        #[arg(long, value_delimiter = ',')]
+        allowed_users: Option<Vec<String>>,
+        /// JWKS endpoint URL used to verify incoming JWT signatures.
+        /// Example: https://keycloak.example.com/realms/myrealm/protocol/openid-connect/certs
+        /// Required when --allowed-users is set.
+        #[arg(long)]
+        jwks_url: Option<String>,
         #[command(flatten)]
         shared_flags: ShareJoinFlags,
     },
