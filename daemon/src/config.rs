@@ -56,6 +56,9 @@ pub struct AppConfig {
     pub jwks_url: Option<String>,
     /// JWT bearer token to present when connecting to a host (joiner side only).
     pub auth_token: Option<String>,
+    /// Name of the JWT claim to match against `allowed_users` (host side only).
+    /// Defaults to `"sub"` when not set.
+    pub username_claim: Option<String>,
 }
 
 impl AppConfig {
@@ -123,6 +126,7 @@ impl AppConfig {
             // not from the config file.
             allowed_users: app_config_cli.allowed_users,
             jwks_url: app_config_cli.jwks_url,
+            username_claim: app_config_cli.username_claim,
             // auth_token can optionally be stored in the config file for convenience.
             auth_token: app_config_cli.auth_token.or_else(|| {
                 general_section

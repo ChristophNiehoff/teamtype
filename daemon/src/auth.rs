@@ -11,15 +11,13 @@
 use anyhow::{Context, Result, anyhow, bail};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
+use serde_json::Value;
+use std::collections::HashMap;
 use tokio::sync::RwLock;
 use tracing::debug;
 
-// ── Internal types ─────────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct Claims {
-    preferred_username: String,
-}
+/// The JWT claim name used when none is explicitly configured.
+pub const DEFAULT_USERNAME_CLAIM: &str = "sub";
 
 #[derive(Debug, Deserialize)]
 struct JwksKey {
@@ -73,11 +71,14 @@ impl JwksCache {
         Ok(())
     }
 
-    /// Validate an RS256 JWT and return its `preferred_username` claim on success.
+    /// Validate an RS256 JWT and return the value of `claim_name` on success.
+    ///
+    /// The claim value must be a JSON string. Returns an error if the claim is
+    /// absent, not a string, or if signature / expiry validation fails.
     ///
     /// If the JWKS cache is empty, this will call [`Self::refresh`] first.
     /// The token's `exp` claim is validated automatically.
-    pub async fn validate_token(&self, token: &str) -> Result<String> {
+    pub async fn validate_token(&self, token: &str, claim_name: &str) -> Result<String> {
         // Ensure the cache is populated.
         if self.keys.read().await.is_none() {
             self.refresh().await?;
@@ -123,14 +124,27 @@ impl JwksCache {
 
         let mut validation = Validation::new(Algorithm::RS256);
         validation.validate_exp = true;
-        // We don't require an `aud` claim; the allow-list check on
-        // `preferred_username` is the authorization mechanism.
+        // We don't require an `aud` claim; the allow-list check on the
+        // configured username claim is the authorization mechanism.
         validation.validate_aud = false;
 
-        let token_data = decode::<Claims>(token, &decoding_key, &validation)
-            .context("JWT validation failed")?;
+        // Decode into a generic map so we can look up any claim by name at
+        // runtime without needing a statically-typed struct.
+        let token_data =
+            decode::<HashMap<String, Value>>(token, &decoding_key, &validation)
+                .context("JWT validation failed")?;
 
-        Ok(token_data.claims.preferred_username)
+        let value = token_data
+            .claims
+            .get(claim_name)
+            .ok_or_else(|| anyhow!("JWT does not contain the '{claim_name}' claim"))?;
+
+        let username = value
+            .as_str()
+            .ok_or_else(|| anyhow!("JWT claim '{claim_name}' is not a string"))?
+            .to_owned();
+
+        Ok(username)
     }
 }
 
@@ -180,7 +194,6 @@ mod tests {
     use rsa::pkcs1::EncodeRsaPrivateKey as _;
     use rsa::traits::PublicKeyParts as _;
     use rsa::{RsaPrivateKey, RsaPublicKey};
-    use serde::Serialize;
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -216,34 +229,29 @@ mod tests {
         json!({ "keys": [key] })
     }
 
-    /// Sign a JWT with the given private key, `preferred_username` claim, and expiry offset in seconds.
+    /// Sign a JWT placing `username_value` in the claim named `claim_name`.
     fn sign_jwt(
         private: &RsaPrivateKey,
-        preferred_username: &str,
+        claim_name: &str,
+        username_value: &str,
         exp_offset_secs: i64,
         kid: Option<&str>,
     ) -> String {
-        #[derive(Serialize)]
-        struct TestClaims {
-            preferred_username: String,
-            exp: i64,
-        }
+        use std::collections::HashMap;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
 
-        let claims = TestClaims {
-            preferred_username: preferred_username.to_string(),
-            exp: now + exp_offset_secs,
-        };
+        let mut claims: HashMap<&str, serde_json::Value> = HashMap::new();
+        claims.insert(claim_name, serde_json::json!(username_value));
+        claims.insert("exp", serde_json::json!(now + exp_offset_secs));
 
         let der = private
             .to_pkcs1_der()
             .expect("Failed to encode RSA private key as DER");
-        let encoding_key =
-            EncodingKey::from_rsa_der(der.as_bytes());
+        let encoding_key = EncodingKey::from_rsa_der(der.as_bytes());
 
         let mut header = Header::new(Algorithm::RS256);
         if let Some(kid) = kid {
@@ -264,33 +272,57 @@ mod tests {
     // ── tests ──────────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn valid_token_returns_sub() {
+    async fn valid_token_default_claim_returns_value() {
         let (private, public) = generate_rsa_keypair();
-        let token = sign_jwt(&private, "alice", 3600, None);
+        let token = sign_jwt(&private, "sub", "alice", 3600, None);
         let cache = cache_with_jwks(build_jwks_json(&public, None)).await;
 
-        let sub = cache.validate_token(&token).await.unwrap();
-        assert_eq!(sub, "alice");
+        let value = cache.validate_token(&token, "sub").await.unwrap();
+        assert_eq!(value, "alice");
     }
 
     #[tokio::test]
-    async fn valid_token_with_kid_returns_sub() {
+    async fn valid_token_custom_claim_returns_value() {
         let (private, public) = generate_rsa_keypair();
-        let token = sign_jwt(&private, "bob", 3600, Some("key-1"));
+        let token = sign_jwt(&private, "preferred_username", "alice", 3600, None);
+        let cache = cache_with_jwks(build_jwks_json(&public, None)).await;
+
+        let value = cache
+            .validate_token(&token, "preferred_username")
+            .await
+            .unwrap();
+        assert_eq!(value, "alice");
+    }
+
+    #[tokio::test]
+    async fn missing_claim_is_rejected() {
+        let (private, public) = generate_rsa_keypair();
+        // Token only has "sub", not "preferred_username".
+        let token = sign_jwt(&private, "sub", "alice", 3600, None);
+        let cache = cache_with_jwks(build_jwks_json(&public, None)).await;
+
+        let result = cache.validate_token(&token, "preferred_username").await;
+        assert!(result.is_err(), "Expected missing claim to be rejected");
+    }
+
+    #[tokio::test]
+    async fn valid_token_with_kid_returns_value() {
+        let (private, public) = generate_rsa_keypair();
+        let token = sign_jwt(&private, "sub", "bob", 3600, Some("key-1"));
         let cache = cache_with_jwks(build_jwks_json(&public, Some("key-1"))).await;
 
-        let sub = cache.validate_token(&token).await.unwrap();
-        assert_eq!(sub, "bob");
+        let value = cache.validate_token(&token, "sub").await.unwrap();
+        assert_eq!(value, "bob");
     }
 
     #[tokio::test]
     async fn expired_token_is_rejected() {
         let (private, public) = generate_rsa_keypair();
         // exp well in the past (one hour ago), comfortably outside any leeway
-        let token = sign_jwt(&private, "alice", -3600, None);
+        let token = sign_jwt(&private, "sub", "alice", -3600, None);
         let cache = cache_with_jwks(build_jwks_json(&public, None)).await;
 
-        let result = cache.validate_token(&token).await;
+        let result = cache.validate_token(&token, "sub").await;
         assert!(result.is_err(), "Expected expired token to be rejected");
     }
 
@@ -299,10 +331,10 @@ mod tests {
         let (private, _public) = generate_rsa_keypair();
         let (_other_private, other_public) = generate_rsa_keypair();
         // Token signed with `private`, JWKS contains `other_public` under different kid.
-        let token = sign_jwt(&private, "alice", 3600, Some("key-1"));
+        let token = sign_jwt(&private, "sub", "alice", 3600, Some("key-1"));
         let cache = cache_with_jwks(build_jwks_json(&other_public, Some("key-2"))).await;
 
-        let result = cache.validate_token(&token).await;
+        let result = cache.validate_token(&token, "sub").await;
         assert!(result.is_err(), "Expected wrong-kid token to be rejected");
     }
 
@@ -311,10 +343,10 @@ mod tests {
         let (private, _public) = generate_rsa_keypair();
         let (_other_private, other_public) = generate_rsa_keypair();
         // Token signed with `private`, but JWKS has `other_public` -- signature mismatch.
-        let token = sign_jwt(&private, "alice", 3600, None);
+        let token = sign_jwt(&private, "sub", "alice", 3600, None);
         let cache = cache_with_jwks(build_jwks_json(&other_public, None)).await;
 
-        let result = cache.validate_token(&token).await;
+        let result = cache.validate_token(&token, "sub").await;
         assert!(result.is_err(), "Expected signature mismatch to be rejected");
     }
 

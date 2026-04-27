@@ -67,7 +67,7 @@ Each joiner obtains a JWT from the identity provider and passes it when connecti
 teamtype join --auth-token eyJhbGciOiJSUzI1NiIs...
 ```
 
-The host validates the token's signature and checks the `preferred_username` claim against the allow list. Connections from unknown or expired tokens are rejected before any document synchronization begins.
+The host validates the token's signature and checks a configurable JWT claim (default: `sub`) against the allow list. Connections from unknown or expired tokens are rejected before any document synchronization begins.
 
 Full details and configuration options are described in the [Configuration](configuration.md#jwt-allow-list-authentication) chapter.
 

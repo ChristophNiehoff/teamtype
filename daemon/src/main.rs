@@ -80,6 +80,7 @@ async fn main() -> Result<()> {
                     no_join_code,
                     allowed_users,
                     jwks_url,
+                    username_claim,
                     shared_flags:
                         ShareJoinFlags {
                             magic_wormhole_relay,
@@ -106,6 +107,7 @@ async fn main() -> Result<()> {
                         username,
                         allowed_users,
                         jwks_url,
+                        username_claim,
                         auth_token: None,
                     };
                     app_config = AppConfig::from_config_file_and_cli(app_config_cli);
@@ -146,6 +148,7 @@ async fn main() -> Result<()> {
                         username,
                         allowed_users: None,
                         jwks_url: None,
+                        username_claim: None,
                         auth_token,
                     };
 

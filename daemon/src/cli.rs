@@ -85,8 +85,9 @@ pub enum Commands {
         /// Print the secret address. Useful for sharing with multiple people.
         #[arg(long)]
         show_secret_address: bool,
-        /// Comma-separated list of allowed `preferred_username` claim values.
-        /// When set, joining peers must present a valid JWT whose `preferred_username` is in this list.
+        /// Comma-separated list of allowed values for the JWT username claim.
+        /// When set, joining peers must present a valid JWT whose username claim
+        /// value is in this list. The claim checked is determined by --username-claim.
         /// Requires --jwks-url.
         #[arg(long, value_delimiter = ',')]
         allowed_users: Option<Vec<String>>,
@@ -95,6 +96,11 @@ pub enum Commands {
         /// Required when --allowed-users is set.
         #[arg(long)]
         jwks_url: Option<String>,
+        /// Name of the JWT claim to match against --allowed-users.
+        /// Defaults to "sub".
+        /// Common alternatives: preferred_username, email, azp.
+        #[arg(long)]
+        username_claim: Option<String>,
         #[command(flatten)]
         shared_flags: ShareJoinFlags,
     },

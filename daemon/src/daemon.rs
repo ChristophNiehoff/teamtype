@@ -977,6 +977,7 @@ impl Daemon {
             app_config.discovery.clone(),
             app_config.allowed_users.clone(),
             app_config.jwks_url.clone(),
+            app_config.username_claim.clone(),
         )
         .await
         .expect("Failed to start connection manager");

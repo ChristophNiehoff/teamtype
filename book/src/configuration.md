@@ -37,8 +37,18 @@ teamtype share \
   --jwks-url https://keycloak.example.com/realms/myrealm/protocol/openid-connect/certs
 ```
 
-- **`--allowed-users`**: Comma-separated list of permitted `preferred_username` claim values. Joining peers whose token's `preferred_username` is not in this list are rejected.
+- **`--allowed-users`**: Comma-separated list of permitted values for the username claim. Which claim is read from the token is controlled by `--username-claim` (default: `sub`). Joining peers whose token's claim value is not in this list are rejected.
 - **`--jwks-url`**: URL of the JWKS endpoint used to verify JWT signatures. Keycloak exposes this at `<realm-url>/protocol/openid-connect/certs`. Both flags must be set together.
+- **`--username-claim`**: Name of the JWT claim to match against `--allowed-users`. Defaults to `sub`. Set to `preferred_username` (or `email`, `azp`, etc.) if your identity provider uses a different claim.
+
+Example using Keycloak's `preferred_username`:
+
+```bash
+teamtype share \
+  --allowed-users alice,bob \
+  --jwks-url https://keycloak.example.com/realms/myrealm/protocol/openid-connect/certs \
+  --username-claim preferred_username
+```
 
 The host fetches the JWKS keys on startup and uses them to verify every incoming connection. RS256 tokens are supported.
 
@@ -62,7 +72,7 @@ When JWT auth is enabled:
 
 1. The joiner sends the passphrase (existing authentication) followed by the JWT token.
 2. The host verifies the JWT signature against the JWKS keys.
-3. The host checks that the token's `preferred_username` claim is in the allow list.
+3. The host checks that the token's username claim (configured via `--username-claim`, default `sub`) is in the allow list.
 4. The host sends back an accept or reject byte. The joiner is informed if the connection is rejected.
 
 When `--allowed-users` is **not** set on the host, no JWT is expected and the old passphrase-only protocol is used unchanged (backward compatible).
