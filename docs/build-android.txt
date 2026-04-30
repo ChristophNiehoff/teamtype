@@ -1,0 +1,72 @@
+Building teamtype for Android / Termux (ARM64)
+===============================================
+
+Prerequisites
+-------------
+
+1. Install the Rust Android target (once per machine):
+
+     rustup target add aarch64-linux-android
+
+2. Download the Android NDK from https://developer.android.com/ndk/downloads
+   and unpack it. Then export the path:
+
+     export ANDROID_NDK_HOME=/path/to/android-ndk-r27c
+
+   API level 21 (Android 5.0) is used by default. If you need a different
+   level, edit ANDROID_CLANG in the Makefile.
+
+
+Build
+-----
+
+From the repository root:
+
+     make build-android-arm64
+
+The binary is written to:
+
+     dist/teamtype-android-arm64
+
+
+Post-build: patch PT_TLS alignment
+------------------------------------
+
+Bionic (Android's libc) requires the PT_TLS segment's p_align to be 64 (0x40).
+The Rust linker produces 8 (0x8), which causes a crash on startup.
+
+Patch the binary with the patch-tls-alignment utility before deploying:
+
+     patch-tls-alignment dist/teamtype-android-arm64
+
+Verify the patch was applied:
+
+     readelf -lW dist/teamtype-android-arm64 | grep TLS
+     # → TLS ... 0x40   ← must be 0x40, not 0x8
+
+
+Verify the binary type
+----------------------
+
+     file dist/teamtype-android-arm64
+     # → ELF 64-bit LSB pie executable, ARM aarch64 ...
+     #                   ^^^
+     #                   "pie executable" confirms ET_DYN (e_type=3),
+     #                   which Bionic accepts.
+
+
+Deploy to device
+----------------
+
+Copy the patched binary to the device via adb or scp:
+
+     adb push dist/teamtype-android-arm64 \
+         /data/data/com.termux/files/home/productivity/bin/teamtype
+
+     # or over SSH:
+     scp dist/teamtype-android-arm64 user@device:~/productivity/bin/teamtype
+
+Then on the device:
+
+     chmod +x ~/productivity/bin/teamtype
+     ~/productivity/bin/teamtype --version
