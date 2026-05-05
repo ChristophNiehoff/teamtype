@@ -114,6 +114,7 @@ features = ["rt", "io-std", "io-util", "macros", "net", "time"]
 [dev-dependencies]
 base64 = "0.22"
 pretty_assertions = "1.4.0"
+ring = "0.17"
 rsa = "0.9"
 tracing-test = "0.2.4"
 
