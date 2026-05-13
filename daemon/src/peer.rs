@@ -676,7 +676,6 @@ impl IrohConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     /// Create a temp dir with the `.teamtype/` subdirectory that `get_keypair` expects.
     fn make_temp_base_dir() -> tempfile::TempDir {
@@ -808,7 +807,8 @@ mod tests {
     fn build_test_jwks_json(public: &RsaPublicKey, kid: Option<&str>) -> serde_json::Value {
         let n = URL_SAFE_NO_PAD.encode(public.n().to_bytes_be());
         let e = URL_SAFE_NO_PAD.encode(public.e().to_bytes_be());
-        let mut key = serde_json::json!({ "kty": "RSA", "n": n, "e": e });
+        let mut key =
+            serde_json::json!({ "kty": "RSA", "n": n, "e": e, "alg": "RS256", "use": "sig" });
         if let Some(kid) = kid {
             key["kid"] = serde_json::json!(kid);
         }
