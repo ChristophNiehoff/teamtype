@@ -139,3 +139,10 @@ inherits = "release"
 lto = true
 codegen-units = 1
 opt-level = "s"
+
+# Patch iroh-quinn-udp to retry on GSO failure (EIO) instead of propagating
+# the error. Android kernels may claim UDP_SEGMENT support but fail actual
+# sendmsg calls with EIO, causing QUIC connections to drop on the first large
+# data send. The patched version retries without segmentation offload.
+[patch.crates-io]
+iroh-quinn-udp = { path = "../patches/iroh-quinn-udp" }
